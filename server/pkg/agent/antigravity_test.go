@@ -567,10 +567,11 @@ func TestReadAntigravityTranscriptOutput(t *testing.T) {
 		`{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":8,"content":"Done: created result.txt and verified it."}`,
 	})
 
-	// MODEL/DONE text is joined in order; null/tool/non-model/non-DONE records
-	// are all dropped.
+	// Only the final MODEL/DONE reply after the latest tool boundary is
+	// returned; earlier narration ("First I will read the file."), null, tool,
+	// non-model, and non-DONE records are all dropped.
 	got := readAntigravityTranscriptOutput(logPath, cid)
-	want := "First I will read the file.\n\nDone: created result.txt and verified it."
+	want := "Done: created result.txt and verified it."
 	if got != want {
 		t.Fatalf("readAntigravityTranscriptOutput mismatch\n got: %q\nwant: %q", got, want)
 	}
@@ -921,13 +922,23 @@ JSONL
 		t.Fatal(err)
 	}
 	var tools []Message
+	var streamed strings.Builder
 	for msg := range session.Messages {
-		if msg.Type == MessageToolUse || msg.Type == MessageToolResult {
+		switch msg.Type {
+		case MessageToolUse, MessageToolResult:
 			tools = append(tools, msg)
+		case MessageText:
+			streamed.WriteString(msg.Content)
 		}
 	}
 	result := <-session.Result
-	if result.Status != "completed" || result.Output != "Waiting for completion.\nCommand finished.\n" {
+	// Intermediate wait text stays in the live transcript, while Result.Output
+	// carries only the final post-wakeup reply so channel replies do not echo
+	// interim waiting narration.
+	if streamed.String() != "Waiting for completion.\nCommand finished.\n" {
+		t.Fatalf("streamed transcript = %q, want both wait and final text", streamed.String())
+	}
+	if result.Status != "completed" || result.Output != "Command finished.\n" {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 	if len(tools) != 2 || tools[0].Type != MessageToolUse || tools[1].Type != MessageToolResult ||
@@ -938,6 +949,127 @@ JSONL
 	if len(result.Usage) != 1 || result.Usage["unknown"] != want {
 		t.Fatalf("usage = %+v, want %+v", result.Usage, want)
 	}
+}
+
+func TestAntigravityBackendDropsPreToolNarrationFromResultOutput(t *testing.T) {
+	t.Parallel()
+
+	t.Run("pre-tool reasoning and narration excluded while final reply kept", func(t *testing.T) {
+		fakePath := filepath.Join(t.TempDir(), "agy")
+		writeTestExecutable(t, fakePath, []byte(`#!/bin/sh
+cat <<'JSONL'
+{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"WAIT — let me check the tool first.\n"}}
+{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo ok"}}}}
+{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo ok"},"output":"ok"}}}
+{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"Final answer"}}
+{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"agent_response","text_delta":" for Slack.\n"}}
+{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"checkpoint"}}
+{"event":"result","result":{"status":"SUCCESS","response":"WAIT — let me check the tool first.\nFinal answer for Slack.\n"}}
+JSONL
+`))
+		backend := &antigravityBackend{cfg: Config{ExecutablePath: fakePath, Logger: quietAntigravityLogger()}}
+		session, err := backend.Execute(context.Background(), "prompt", ExecOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var streamed strings.Builder
+		for msg := range session.Messages {
+			if msg.Type == MessageText {
+				streamed.WriteString(msg.Content)
+			}
+		}
+		result := <-session.Result
+		if result.Status != "completed" {
+			t.Fatalf("status = %q, want completed (err=%q)", result.Status, result.Error)
+		}
+		if result.Output != "Final answer for Slack.\n" {
+			t.Fatalf("result.Output = %q, want only post-tool answer", result.Output)
+		}
+		if streamed.String() != "WAIT — let me check the tool first.\nFinal answer for Slack.\n" {
+			t.Fatalf("streamed transcript = %q, want full text preserved", streamed.String())
+		}
+	})
+
+	t.Run("tool-terminated turn drops pre-tool narration instead of promoting it", func(t *testing.T) {
+		fakePath := filepath.Join(t.TempDir(), "agy")
+		writeTestExecutable(t, fakePath, []byte(`#!/bin/sh
+cat <<'JSONL'
+{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"Let me post that comment now.\n"}}
+{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","output":"ok"}}}
+{"event":"result","result":{"status":"SUCCESS","response":"Let me post that comment now.\n"}}
+JSONL
+`))
+		backend := &antigravityBackend{cfg: Config{ExecutablePath: fakePath, Logger: quietAntigravityLogger()}}
+		session, err := backend.Execute(context.Background(), "prompt", ExecOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range session.Messages {
+		}
+		result := <-session.Result
+		if result.Status != "completed" {
+			t.Fatalf("status = %q, want completed", result.Status)
+		}
+		if result.Output != "" {
+			t.Fatalf("result.Output = %q, want empty output when turn ends on tool call", result.Output)
+		}
+	})
+
+	t.Run("recovers post-tool transcript answer after pre-tool narration when final delta missing", func(t *testing.T) {
+		appDataDir := t.TempDir()
+		cid := "55a57718-801c-41e7-9691-3225be2b1cb9"
+		seedAntigravityTranscript(t, appDataDir, cid, []string{
+			`{"type":"USER_INPUT","source":"USER_EXPLICIT","status":"DONE","step_index":0,"content":"check status"}`,
+			`{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":1,"content":"Let me check first.","tool_calls":[{"name":"run_command"}]}`,
+			`{"type":"GENERIC","source":"MODEL","status":"DONE","step_index":2}`,
+			`{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","step_index":3,"content":"Recovered post-tool answer."}`,
+		})
+		fakePath := filepath.Join(t.TempDir(), "agy")
+		script := fmt.Sprintf(`#!/bin/sh
+log=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --log-file) log="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -z "$log" ] || printf '%%s\n' 'I0630 14:19:40.582492 1 common.go:156] CLI app data directory: %s' >> "$log"
+cat <<'JSONL'
+{"event":"init","conversation_id":"%s","init":{}}
+{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"Let me check first.\n"}}
+{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","output":"ok"}}}
+{"event":"result","result":{"conversation_id":"%s","status":"SUCCESS","response":"Let me check first.\n"}}
+JSONL
+`, appDataDir, cid, cid)
+		writeTestExecutable(t, fakePath, []byte(script))
+		backend := &antigravityBackend{cfg: Config{ExecutablePath: fakePath, Logger: quietAntigravityLogger()}}
+		session, err := backend.Execute(context.Background(), "prompt", ExecOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range session.Messages {
+		}
+		result := <-session.Result
+		if result.Status != "completed" || result.Output != "Recovered post-tool answer." {
+			t.Fatalf("result = %+v, want recovered post-tool answer", result)
+		}
+	})
+
+	t.Run("same-index boundary collision treats text as dropped", func(t *testing.T) {
+		turn := antigravityTurn{
+			steps: map[int]antigravityStepSummary{
+				2: {kind: "tool", state: "DONE", hasText: true},
+			},
+		}
+		turn.observeAgentText(2, "Narration on colliding index")
+		got, dropped := turn.finalDeliverable()
+		if got != "" || !dropped {
+			t.Fatalf("finalDeliverable() = (%q, %v), want (\"\", true)", got, dropped)
+		}
+	})
 }
 
 func TestAntigravityBackendStreamJSONCapturesUsage(t *testing.T) {
@@ -1486,12 +1618,12 @@ func TestAntigravityCurrentTurnRecovery(t *testing.T) {
 	const retryError = "Malformed function call: Function call is empty - no input to parse. Retries remaining: 3"
 	const resumeEOF = "API error (attempt 3): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": EOF"
 	for _, tc := range []struct {
-		name, steps, status, response, cause string
-		exit                                 int
-		resumed, completed                   bool
+		name, steps, status, response, wantOutput, cause string
+		exit                                             int
+		resumed, completed                               bool
 	}{
-		{name: "retry with narration and executor log", steps: boundary + step(11, "agent_response", "DONE", "Working.\n") + step(12, "tool", "DONE", "") + step(13, "error_message", "DONE", "") + answer, completed: true},
-		{name: "partial attempt before retry", steps: boundary + step(11, "agent_response", "ACTIVE", "Partial attempt") + step(13, "error_message", "DONE", "") + answer, completed: true},
+		{name: "retry with narration and executor log", steps: boundary + step(11, "agent_response", "DONE", "Working.\n") + step(12, "tool", "DONE", "") + step(13, "error_message", "DONE", "") + answer, wantOutput: "Final answer.\n", completed: true},
+		{name: "partial attempt before retry", steps: boundary + step(11, "agent_response", "ACTIVE", "Partial attempt") + step(13, "error_message", "DONE", "") + answer, wantOutput: "Final answer.\n", completed: true},
 		{name: "canonical response need not equal deltas", steps: boundary + answer, response: "Canonical answer from agy.", completed: true},
 		{name: "historical quota", steps: step(1, "error_message", "DONE", "") + boundary + answer, cause: "RESOURCE_EXHAUSTED (429)", resumed: true, completed: true},
 		{name: "historical unavailable", steps: boundary + answer, cause: "UNAVAILABLE (503)", resumed: true, completed: true},
@@ -1570,8 +1702,12 @@ cat <<'JSONL'
 			} else if tc.status == "CANCELLED" {
 				want = "cancelled"
 			}
-			if result.Status != want || result.Output != tc.response || (result.Error == "") != tc.completed {
-				t.Fatalf("result = %+v, want %s preserving canonical response", result, want)
+			wantOutput := tc.response
+			if tc.wantOutput != "" {
+				wantOutput = tc.wantOutput
+			}
+			if result.Status != want || result.Output != wantOutput || (result.Error == "") != tc.completed {
+				t.Fatalf("result = %+v, want %s with output %q", result, want, wantOutput)
 			}
 			if tc.completed && (!strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), fmt.Sprintf("err=%q", tc.cause))) {
 				t.Fatalf("missing warning with original error: %s", logs.String())

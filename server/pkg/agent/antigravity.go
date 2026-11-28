@@ -208,7 +208,61 @@ type antigravityTurn struct {
 	checkTranscript  bool
 	rescanTranscript bool
 	steps            map[int]antigravityStepSummary
+	stepText         map[int]*strings.Builder
 	invalid          bool
+}
+
+func (t *antigravityTurn) observeAgentText(index int, delta string) {
+	if delta == "" {
+		return
+	}
+	if t.stepText == nil {
+		t.stepText = make(map[int]*strings.Builder)
+	}
+	buf := t.stepText[index]
+	if buf == nil {
+		buf = &strings.Builder{}
+		t.stepText[index] = buf
+	}
+	buf.WriteString(delta)
+}
+
+// finalDeliverable selects only the final user-facing agent_response step's
+// text after the latest tool, subagent, system_message, user_input, or
+// error_message boundary (#6006). droppedEarlier reports whether any earlier
+// non-empty agent_response step was excluded (pre-tool narration, background
+// wait messages, or superseded partial attempts), which tells the caller not
+// to adopt agy's concatenated result.response verbatim on completed turns.
+func (t *antigravityTurn) finalDeliverable() (text string, droppedEarlier bool) {
+	lastBoundary := -1
+	for index, step := range t.steps {
+		switch step.kind {
+		case "tool", "subagent", "system_message", "user_input", "error_message":
+			if index > lastBoundary {
+				lastBoundary = index
+			}
+		}
+	}
+	latestAfterBoundary := -1
+	nonEmptyCount := 0
+	for index, buf := range t.stepText {
+		if buf == nil || strings.TrimSpace(buf.String()) == "" {
+			continue
+		}
+		nonEmptyCount++
+		if index <= lastBoundary {
+			droppedEarlier = true
+		} else if index > latestAfterBoundary {
+			latestAfterBoundary = index
+		}
+	}
+	if nonEmptyCount > 1 {
+		droppedEarlier = true
+	}
+	if latestAfterBoundary >= 0 {
+		return t.stepText[latestAfterBoundary].String(), droppedEarlier
+	}
+	return "", droppedEarlier
 }
 
 // observeUserInput classifies a user_input step. The first one opens the turn;
@@ -503,6 +557,7 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 		streamStepUsage := make(map[int]TokenUsage)
 		streamTools := make(map[int]antigravityToolState)
 		turn := antigravityTurn{steps: make(map[int]antigravityStepSummary)}
+		var unindexedAgentText bool
 		transcript := &antigravityTranscript{logPath: logPath}
 		finalStatus := "completed"
 		var finalError string
@@ -568,6 +623,11 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 						}
 					}
 					if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
+						if idx := event.StepUpdate.StepIndex; idx != nil && *idx >= 0 {
+							turn.observeAgentText(*idx, event.StepUpdate.TextDelta)
+						} else if strings.TrimSpace(event.StepUpdate.TextDelta) != "" {
+							unindexedAgentText = true
+						}
 						output.WriteString(event.StepUpdate.TextDelta)
 						trySend(msgCh, Message{Type: MessageText, Content: event.StepUpdate.TextDelta})
 					}
@@ -679,7 +739,15 @@ func (b *antigravityBackend) Execute(ctx context.Context, prompt string, opts Ex
 		}
 
 		finalOutput := output.String()
-		if streamResponse != "" {
+		deliverable, droppedEarlier := turn.finalDeliverable()
+		if finalStatus == "completed" && droppedEarlier && !unindexedAgentText {
+			// Structured step_updates show earlier agent_response subturns
+			// (pre-tool narration, background-wakeup wait messages, or retried
+			// partial attempts) were superseded by a later boundary. Do not
+			// replace that slice with result.response, which agy builds by
+			// concatenating every agent_response step in the turn.
+			finalOutput = deliverable
+		} else if streamResponse != "" {
 			// result.response is agy's canonical complete reply. Deltas normally
 			// reconstruct it exactly; if none arrived, emit the response now so
 			// the task transcript and final result both receive the answer.
@@ -841,17 +909,26 @@ var antigravityAppDataDirRe = regexp.MustCompile(`CLI app data directory:\s*(.+)
 // step — it is RawMessage so a null or non-string value is skipped rather than
 // failing the whole line.
 type antigravityTranscriptRecord struct {
-	Type    string          `json:"type"`
-	Source  string          `json:"source"`
-	Status  string          `json:"status"`
-	Content json.RawMessage `json:"content"`
+	Type      string          `json:"type"`
+	Source    string          `json:"source"`
+	Status    string          `json:"status"`
+	Content   json.RawMessage `json:"content"`
+	ToolCalls json.RawMessage `json:"tool_calls"`
 }
 
-// readAntigravityTranscriptOutput recovers the assistant's text from agy's
-// per-conversation transcript when stdout carried nothing. agy 1.0.14's print
-// mode can finish a turn (tools executed, final reply produced) while emitting
-// zero bytes to stdout, leaving the daemon with a blank but "completed" run
-// (MUL-3726, #4595). The full reply is still durably written to:
+func antigravityHasToolCalls(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var calls []json.RawMessage
+	return json.Unmarshal(raw, &calls) == nil && len(calls) > 0
+}
+
+// readAntigravityTranscriptOutput recovers the assistant's final deliverable
+// text from agy's per-conversation transcript when stdout carried nothing. agy
+// 1.0.14's print mode can finish a turn (tools executed, final reply produced)
+// while emitting zero bytes to stdout, leaving the daemon with a blank but
+// "completed" run (MUL-3726, #4595). The reply is durably written to:
 //
 //	<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl
 //
@@ -859,15 +936,12 @@ type antigravityTranscriptRecord struct {
 //
 // The transcript is per-conversation and ACCUMULATES across resumed turns
 // (daemon reuses the conversation via --conversation / ResumeSessionID), so we
-// must return only the CURRENT turn's reply — otherwise a later empty-stdout
-// turn would re-emit prior turns' answers. Each turn opens with a USER_INPUT
-// record, so we reset on every USER_INPUT and keep only the model text that
-// follows the last one. We also require status=DONE to skip any future
-// streaming/partial planner records. The remaining text is joined in order
-// (intermediate narration + final reply), mirroring what stdout would have
-// streamed for this turn. Best-effort: returns "" if the app data dir or
-// conversation id is unknown, the transcript is missing, or it holds no model
-// text for the current turn.
+// reset on every USER_INPUT, SYSTEM_MESSAGE, or tool/action record and keep
+// only the final non-empty MODEL/DONE PLANNER_RESPONSE after the latest tool
+// or wakeup boundary (excluding pre-tool narration and tool-calling planner
+// steps, matching #6006). Best-effort: returns "" if the app data dir or
+// conversation id is unknown, the transcript is missing, or it holds no final
+// model text for the current turn.
 func readAntigravityTranscriptOutput(logPath, conversationID string) string {
 	if logPath == "" || conversationID == "" {
 		return ""
@@ -885,7 +959,7 @@ func readAntigravityTranscriptOutput(logPath, conversationID string) string {
 	}
 	defer f.Close()
 
-	var parts []string
+	var finalAnswer string
 	scanner := newAgentStreamScanner(f)
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -896,13 +970,21 @@ func readAntigravityTranscriptOutput(logPath, conversationID string) string {
 		if err := json.Unmarshal(line, &rec); err != nil {
 			continue
 		}
-		if rec.Type == "USER_INPUT" {
-			// New turn boundary: drop anything collected for prior turns so a
-			// resumed conversation yields only the current turn's reply.
-			parts = parts[:0]
+		if rec.Type != "PLANNER_RESPONSE" {
+			if rec.Type != "" && rec.Type != "CHECKPOINT" {
+				// Turn, wakeup, or tool execution boundary: drop earlier
+				// turns' answers and pre-tool/pre-wakeup narration.
+				finalAnswer = ""
+			}
 			continue
 		}
-		if rec.Type != "PLANNER_RESPONSE" || rec.Source != "MODEL" || rec.Status != "DONE" {
+		if rec.Source != "MODEL" || rec.Status != "DONE" {
+			continue
+		}
+		if antigravityHasToolCalls(rec.ToolCalls) {
+			// A planner step that invokes tools is intermediate even if it
+			// carries narration text.
+			finalAnswer = ""
 			continue
 		}
 		var text string
@@ -912,10 +994,10 @@ func readAntigravityTranscriptOutput(logPath, conversationID string) string {
 			continue
 		}
 		if strings.TrimSpace(text) != "" {
-			parts = append(parts, text)
+			finalAnswer = text
 		}
 	}
-	return strings.Join(parts, "\n\n")
+	return finalAnswer
 }
 
 // antigravityTranscriptLineLimit bounds the transcript line the receipt scan
